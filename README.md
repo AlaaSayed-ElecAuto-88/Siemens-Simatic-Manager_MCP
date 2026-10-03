@@ -1,17 +1,33 @@
 # SIMATIC Manager MCP
 
 MCP server for Siemens STEP 7 V5.x (SIMATIC Manager, "classic"). It lets an MCP client such as Claude
-browse and edit STEP 7 projects, and optionally work online with the CPU.
+browse and edit STEP 7 projects, work online with the CPU, and read or write live values.
 
 ## How it works
 
 ```
-MCP client  <--stdio-->  server.py (64-bit Python)  <--JSON lines-->  bridge/s7bridge.ps1 (32-bit PowerShell)  <--COM-->  STEP 7
+                           +-- bridge/s7bridge.ps1 (32-bit PowerShell) -- COM ------- STEP 7 (projects, download, ...)
+MCP client -- server.py ---+
+ (stdio)   (64-bit Python) +-- s7client.py --+-- bridge/s7online_link.ps1 -- S7ONLINE -- PLCSIM or the real PLC
+                                             +-- TCP port 102 ------------------------- real PLC (route "direct")
 ```
 
-STEP 7's automation interface (`Simatic.Simatic`, `S7ABATCX.DLL`) is a 32-bit in-process COM server, so
-64-bit Python cannot load it. `server.py` keeps one 32-bit Windows PowerShell worker alive and sends it
-one request at a time.
+- STEP 7's automation interface (`Simatic.Simatic`) and its `S7ONLINE` driver (`s7onlinx.dll`) are 32-bit
+  only, so 64-bit Python cannot load them. The server keeps 32-bit Windows PowerShell workers alive and
+  sends them one JSON request at a time.
+- Live values use a small built-in S7 protocol client. Through `S7ONLINE` it reaches whatever STEP 7's
+  PG/PC interface reaches, which is S7-PLCSIM whenever the simulator is running.
+
+| File | Purpose |
+| --- | --- |
+| `server.py` | MCP tools |
+| `worker.py` | Runs a PowerShell worker and exchanges JSON lines with it |
+| `bridge/s7bridge.ps1` | STEP 7 command interface (projects, blocks, compile, download, CPU control) |
+| `bridge/s7online_link.ps1` | Carries S7 messages over the `S7ONLINE` access point |
+| `s7client.py` | S7 protocol client: read/write memory, system status lists |
+| `plc_values.py` | Operand addresses and data types |
+| `ladder.py` | Draws STL networks as text ladder rungs |
+| `s7online_gateway.py` | Optional standalone PLCSIM gateway for other S7 client programs |
 
 ## Requirements
 
@@ -35,7 +51,7 @@ Instructions for a person, or for Claude Code when given this repository's link:
 3. Register the server with the absolute path to `server.py`:
 
    ```
-   claude mcp add simatic-manager --scope user -- python "C:\path\to\simatic-manager-mcp\server.py"
+   claude mcp add simatic-manager --scope user -- python "C:\path\to\Siemens-Simatic-Manager_MCP\server.py"
    ```
 
    Or copy `.mcp.example.json` to `.mcp.json` (project scope) or into `claude_desktop_config.json`
@@ -45,44 +61,112 @@ Instructions for a person, or for Claude Code when given this repository's link:
 
 ## Tools
 
-| Tool | Changes | Purpose |
-| --- | --- | --- |
-| `step7_status` | – | Check STEP 7 is reachable, report version |
-| `list_projects` | – | Projects and libraries known to SIMATIC Manager |
-| `get_project_tree` | – | Stations, S7 programs and their containers |
-| `list_blocks` | – | Blocks of a program with header info |
-| `get_block_source` | – | Decompile blocks to STL text (symbolic or absolute) |
-| `list_sources` / `get_source` | – | Read the Sources folder |
-| `get_symbol_table` | – | Symbols, optionally filtered |
-| `get_station_config` | – | Hardware configuration as HW Config export text |
-| `import_source` | offline project | Store STL/SCL text as a source file |
-| `compile_source` | offline project | Compile a source into blocks, returns the compiler log |
-| `import_symbols` | offline project | Add or update symbols |
-| `create_project` / `add_program` | offline project | New empty project / S7 program |
-| `compile_station` | offline project | Compile a station's hardware configuration |
-| `get_cpu_state` | – (online, read) | RUN / STOP / HALT / STARTUP / DEFECT |
-| `list_online_blocks` | – (online, read) | Blocks loaded in the CPU |
-| `compare_online_offline` | – (online, read) | Per block: identical / different / not in CPU |
-| `upload_blocks` | offline project | Copy blocks from the CPU into the project |
-| `download_blocks` | **PLC** | Download offline blocks to the CPU |
-| `start_cpu` / `stop_cpu` | **PLC** | Warm/hot restart, or STOP |
-
 `project` is a project name or path. `program` is a program name or path and can be omitted when the
 project has only one program.
 
-### Enabling tools that change the PLC
+### Read a project (nothing is changed)
 
-`download_blocks`, `start_cpu` and `stop_cpu` refuse to run unless the server is started with
-`S7_MCP_ALLOW_PLC_WRITES=1` (see the `env` block in `.mcp.example.json`). They act on whatever the STEP 7
-PG/PC interface reaches: the real CPU, or S7-PLCSIM when the simulator is running. Test with PLCSIM first.
+| Tool | Purpose |
+| --- | --- |
+| `step7_status` | Check STEP 7 is reachable, report version |
+| `list_projects` | Projects and libraries known to SIMATIC Manager |
+| `get_project_tree` | Stations, S7 programs and their containers |
+| `list_blocks` | Blocks of a program with header info |
+| `get_block_source` | Decompile blocks to STL text (symbolic or absolute) |
+| `get_block_ladder` | Blocks as text-drawn ladder rungs |
+| `list_sources` / `get_source` | Read the Sources folder |
+| `get_symbol_table` | Symbols, optionally filtered |
+| `get_station_config` | Hardware configuration as HW Config export text |
+
+### Change the offline project
+
+| Tool | Purpose |
+| --- | --- |
+| `import_source` | Store STL/SCL text as a source file |
+| `compile_source` | Compile a source into blocks, returns the compiler log |
+| `import_symbols` | Add or update symbols |
+| `copy_blocks` | Copy blocks between programs or projects |
+| `create_project` / `add_program` | New empty project / S7 program |
+| `import_station_config` | Create a station from (edited) HW Config text |
+| `compile_station` | Compile a station's hardware configuration |
+| `upload_blocks` | Copy blocks from the CPU into the project |
+
+### Read from the PLC
+
+| Tool | Purpose |
+| --- | --- |
+| `get_cpu_state` | RUN / STOP / HALT / STARTUP / DEFECT |
+| `list_online_blocks` | Blocks loaded in the CPU |
+| `compare_online_offline` | Per block: identical / different / not in CPU |
+| `read_plc_values` | Live inputs, outputs, memory bits, timers, counters, DB values; by address or symbol name |
+| `get_cpu_diagnostics` | State, order number, firmware, diagnostic buffer |
+
+### Change the PLC (disabled by default)
+
+| Tool | Purpose |
+| --- | --- |
+| `download_blocks` | Download offline blocks to the CPU |
+| `download_system_data` | Download the compiled hardware configuration (CPU in STOP) |
+| `start_cpu` / `stop_cpu` | Warm/hot restart, or STOP |
+| `write_plc_values` | Write memory bits, outputs, DB values |
+| `memory_reset` | Erase the CPU's program (CPU in STOP) |
+| `compress_memory` | Compress the CPU's load memory |
+
+These refuse to run unless the server is started with `S7_MCP_ALLOW_PLC_WRITES=1` (see the `env` block in
+`.mcp.example.json`). They act on whatever STEP 7's PG/PC interface reaches: the real CPU, or S7-PLCSIM
+when the simulator is running. Test with PLCSIM first.
+
+## Live values
+
+`read_plc_values` and `write_plc_values` take the CPU's `address` (MPI/DP station number such as `"2"`, or
+an IP address) and a list of items:
+
+- operand addresses: `I 0.0`, `QB 4`, `MW 10`, `MD 20:REAL`, `DB10.DBX0.1`, `DB10.DBW4:INT`, `T 5`, `C 3`
+  (German mnemonics `E`, `A`, `Z` also work); `:TYPE` overrides the data type
+- symbol names from the program's symbol table, when `project` is given
+
+`route="step7"` (default) goes through STEP 7's PG/PC interface, so it follows the same path as SIMATIC
+Manager and lands in PLCSIM when the simulator is running. `route="direct"` opens TCP port 102 on the IP
+address without STEP 7; it never reaches PLCSIM.
+
+## PLCSIM gateway for other programs
+
+Classic S7-PLCSIM has no network port. `s7online_gateway.py` gives it one, so that other S7 client
+software (python-snap7, an HMI, a SCADA test) can talk to the simulator:
+
+```
+python s7online_gateway.py --address 2 --port 1102
+```
+
+Then connect the client to `127.0.0.1`, port 1102. The server itself does not need the gateway.
+
+## Editing the hardware configuration
+
+STEP 7 cannot update an existing station from text. `import_station_config` always creates a new station
+with an empty program, so the workflow is: `get_station_config`, edit the text, `import_station_config`,
+`compile_station`, then `copy_blocks` and `get_symbol_table` / `import_symbols` to bring the program
+across. The original station is left untouched.
 
 ## Notes
 
 - Close the project's objects in the STEP 7 editors (LAD/STL/FBD, symbol editor) before writing; open
   editors lock them.
 - `start_cpu` and `stop_cpu` fail when the CPU's mode switch is in STOP (in PLCSIM: tick RUN-P).
+- While PLCSIM is running it answers for every MPI address, so a wrong `address` still gets values.
 - Blocks uploaded from a CPU only decompile with `symbolic=True`.
+- `get_block_ladder` draws bit logic, edges, coils, timers and counters; other networks stay as STL.
+- Diagnostic buffer texts are included for common events only; the event ID is always returned.
 - A call that gets no answer within `S7_MCP_TIMEOUT` seconds (default 180) restarts the worker.
-- Worker errors outside a request are written to `%TEMP%\s7mcp_bridge_stderr.log`.
-- Not implemented: downloading hardware configuration / system data, memory reset, monitoring values,
-  editing the hardware configuration.
+- Worker errors outside a request are written to `%TEMP%\s7mcp_*_stderr.log`.
+- Not possible: forcing values, opening know-how-protected blocks, writing timers and counters.
+
+## Test status
+
+Tested against S7-PLCSIM V5.4: project browsing, source import and compile, block download/upload/compare,
+CPU start/stop, live read/write, diagnostics, station import and compile, block copy. Not yet tested:
+anything on a real CPU, `route="direct"` against a real CPU, `download_system_data`, `memory_reset`,
+`compress_memory`, SCL sources.
+
+## Credits
+
+The `S7ONLINE` request block layout follows the open-source NetToPLCsim project by Thomas Wiens.

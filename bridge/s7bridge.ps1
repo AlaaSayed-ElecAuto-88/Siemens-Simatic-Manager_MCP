@@ -32,6 +32,7 @@ $SOURCE_TYPES = @{ 1122309 = 'STL'; 1122310 = 'SCL'; 1122311 = 'GRAPH'; 1122312 
 $SOURCE_EXTS = @{ 1122309 = 'awl'; 1122310 = 'scl'; 1122311 = 'gr7' }
 $CPU_STATES = @{ 256 = 'RUN'; 512 = 'STOP'; 1024 = 'HALT'; 2048 = 'DEFECT'; 4096 = 'STARTUP' }
 $USER_BLOCK_TYPES = @(1138945, 1138946, 1138947, 1138948, 1138950)   # FB, FC, DB, OB, UDT
+$SYSTEM_DATA = 1138955
 $OVERWRITE_ALL = 2
 $OVERWRITE_NONE = 4
 $PROJECT_TYPES = @{ 1122305 = 'project'; 1122306 = 'library' }
@@ -384,6 +385,8 @@ function Op-CpuControl($a) {
         'warm_restart' { $prog.NewStart() }
         'hot_restart' { $prog.Restart() }
         'stop' { $prog.Stop() }
+        'memory_reset' { $prog.Reset() }
+        'compress' { $prog.Compress() }
         default { throw "Unknown action '$($a.action)'." }
     }
     Start-Sleep -Milliseconds 1500
@@ -461,7 +464,59 @@ function Op-CompileStation($a) {
     return [ordered]@{ station = $st.Name; code = [int]$rc; log = (VerbLogSince $logStart) }
 }
 
+function Op-DownloadSystemData($a) {
+    $prog = Resolve-Program $a
+    $c = Find-Container $prog $BLOCK_CONTAINER 'Blocks'
+    $sdb = $null
+    foreach ($b in $c.Next) { if ([int]$b.ConcreteType -eq $SYSTEM_DATA) { $sdb = $b } }
+    if ($null -eq $sdb) { throw "Program '$($prog.Name)' has no System Data; compile the station first." }
+    # Download returns without error when the CPU is unreachable, so check first.
+    if ([int]$prog.ModuleState -eq 0) { throw "The CPU of program '$($prog.Name)' cannot be reached online." }
+    $sdb.Download($OVERWRITE_ALL)
+    return [ordered]@{ program = $prog.LogPath; downloaded = $sdb.Name; cpuState = (CpuState $prog) }
+}
+
+function Op-ImportStation($a) {
+    $proj = Find-Project (Need $a 'project')
+    $tmp = TempFile 'cfg'
+    $logStart = VerbLogLength
+    try {
+        [IO.File]::WriteAllText($tmp, [string](Need $a 'config'), $ansi)
+        $st = $proj.Stations.Import($tmp)
+        return [ordered]@{ station = $st.Name; log = (VerbLogSince $logStart) }
+    } finally {
+        if (Test-Path $tmp) { Remove-Item $tmp -Force }
+    }
+}
+
+function Op-CopyBlocks($a) {
+    $proj = Find-Project (Need $a 'project')
+    $src = Find-Container (Find-Program $proj (Need $a 'source_program')) $BLOCK_CONTAINER 'Blocks'
+    $targetProj = Find-Project (Arg $a 'target_project' (Need $a 'project'))
+    $dst = Find-Container (Find-Program $targetProj (Need $a 'target_program')) $BLOCK_CONTAINER 'Blocks'
+    $overwrite = [bool](Arg $a 'overwrite' $false)
+    $out = New-Object System.Collections.ArrayList
+    foreach ($e in (Select-Blocks $src.Next (Arg $a 'blocks') 'Block')) {
+        $r = [ordered]@{ block = $e.name }
+        $exists = $null
+        try { $exists = $dst.Next.Item([string]$e.name) } catch { }
+        if ($null -ne $e.error) { $r['error'] = $e.error }
+        elseif ($null -ne $exists -and -not $overwrite) { $r['skipped'] = 'already exists in target; pass overwrite=true to replace it' }
+        else {
+            try {
+                if ($null -ne $exists) { $exists.Remove() }
+                [void]$e.block.Copy($dst)
+                $r['copied'] = $true
+            } catch { $r['error'] = $_.Exception.Message }
+        }
+        [void]$out.Add($r)
+    }
+    return , $out
+}
+
 $OPS = @{
+    copy_blocks = 'Op-CopyBlocks'
+    download_system_data ='Op-DownloadSystemData'; import_station = 'Op-ImportStation'
     cpu_state = 'Op-CpuState'; cpu_control = 'Op-CpuControl'; list_online_blocks = 'Op-ListOnlineBlocks'
     download = 'Op-Download'; upload = 'Op-Upload'; compare = 'Op-Compare'; compile_station = 'Op-CompileStation'
     ping = 'Op-Ping'; list_projects = 'Op-ListProjects'; project_tree = 'Op-ProjectTree'
