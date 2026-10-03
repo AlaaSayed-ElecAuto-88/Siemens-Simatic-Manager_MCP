@@ -283,9 +283,13 @@ def stop_cpu(project: str, program: str | None = None) -> dict:
 
 
 @mcp.tool()
-def compile_station(project: str, station: str) -> dict:
-    """Compile a station's hardware configuration (regenerates the offline System Data). Modifies the offline project."""
-    return bridge.call("compile_station", project=project, station=station, timeout=max(DEFAULT_TIMEOUT, 600))
+def compile_station(project: str, station: str, check_only: bool = False) -> dict:
+    """Compile a station's hardware configuration (regenerates the offline System Data). Modifies the offline project.
+
+    check_only runs just the consistency check and changes nothing. Configuration errors are returned in
+    "error" with "consistent": false.
+    """
+    return bridge.call("compile_station", project=project, station=station, check_only=check_only, timeout=max(DEFAULT_TIMEOUT, 600))
 
 
 @mcp.tool()
@@ -313,6 +317,67 @@ def import_station_config(project: str, config: str) -> dict:
     left untouched. Changing parameters and addresses is reliable; hand-writing new modules is fragile.
     """
     return bridge.call("import_station", project=project, config=config, timeout=max(DEFAULT_TIMEOUT, 600))
+
+
+@mcp.tool()
+def get_station_hardware(project: str, station: str) -> dict:
+    """Show a station's racks, modules, I/O addresses, network addresses and DP slaves as a tree.
+
+    Every object has a path used by the other hardware tools: "0.4" is rack 0 slot 4, "0.2.1" is
+    interface 1 of the module in slot 2, "dp1.83" is the slave at address 83 on DP master system 1,
+    and "dp1.83.1" is slot 1 of that slave.
+    """
+    return bridge.call("station_hardware", project=project, station=station)
+
+
+@mcp.tool()
+def get_module_parameters(project: str, station: str, module: str) -> dict:
+    """List the parameters of one module or DP slave (path from get_station_hardware) with their current values."""
+    return bridge.call("module_parameters", project=project, station=station, module=module)
+
+
+@mcp.tool()
+def update_module(
+    project: str,
+    station: str,
+    module: str,
+    name: str | None = None,
+    parameters: dict[str, str] | None = None,
+    ip_address: str | None = None,
+    subnet_mask: str | None = None,
+    mpi_address: int | None = None,
+    profibus_address: int | None = None,
+) -> dict:
+    """Change a module in the existing station, in place. Modifies the offline project.
+
+    parameters maps parameter names from get_module_parameters to new values, e.g.
+    {"SCAN_CYCLE_MONITORING_TIME": "200"}; use "NAME[3]" for a parameter of channel 3. A value STEP 7 does
+    not accept is rejected and the old value kept. I/O addresses cannot be changed this way (STEP 7 does not
+    save them); use get_station_config / import_station_config for that. Run compile_station afterwards.
+    """
+    return bridge.call("update_module", project=project, station=station, module=module, name=name, parameters=parameters,
+                       ip_address=ip_address, subnet_mask=subnet_mask, mpi_address=mpi_address, profibus_address=profibus_address)
+
+
+@mcp.tool()
+def add_module(project: str, station: str, parent: str, slot: int, order_number: str, name: str = "", version: str = "") -> dict:
+    """Insert a module into the existing station. Modifies the offline project.
+
+    parent is the rack ("0") or DP slave ("dp1.5") path; order_number is the catalog number, e.g.
+    "6ES7 321-1BH02-0AA0"; version is the firmware version ("V3.2") where the catalog has several.
+    STEP 7 assigns the next free I/O addresses. Run compile_station afterwards.
+    """
+    return bridge.call("add_module", project=project, station=station, parent=parent, slot=slot,
+                       order_number=order_number, name=name, version=version)
+
+
+@mcp.tool()
+def remove_module(project: str, station: str, module: str) -> dict:
+    """Remove a module from the existing station. Modifies the offline project.
+
+    Removing a CPU also removes its S7 program with all blocks; confirm with the user first.
+    """
+    return bridge.call("remove_module", project=project, station=station, module=module)
 
 
 @mcp.tool()

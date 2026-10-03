@@ -77,6 +77,8 @@ project has only one program.
 | `list_sources` / `get_source` | Read the Sources folder |
 | `get_symbol_table` | Symbols, optionally filtered |
 | `get_station_config` | Hardware configuration as HW Config export text |
+| `get_station_hardware` | Racks, modules, addresses and DP slaves as a tree |
+| `get_module_parameters` | Parameters of one module or DP slave |
 
 ### Change the offline project
 
@@ -87,8 +89,10 @@ project has only one program.
 | `import_symbols` | Add or update symbols |
 | `copy_blocks` | Copy blocks between programs or projects |
 | `create_project` / `add_program` | New empty project / S7 program |
+| `update_module` | Change a module in place: name, parameters, IP / MPI / PROFIBUS address |
+| `add_module` / `remove_module` | Insert or remove a module in an existing station |
 | `import_station_config` | Create a station from (edited) HW Config text |
-| `compile_station` | Compile a station's hardware configuration |
+| `compile_station` | Compile a station's hardware configuration, or only check its consistency |
 | `upload_blocks` | Copy blocks from the CPU into the project |
 
 ### Read from the PLC
@@ -142,10 +146,14 @@ Then connect the client to `127.0.0.1`, port 1102. The server itself does not ne
 
 ## Editing the hardware configuration
 
-STEP 7 cannot update an existing station from text. `import_station_config` always creates a new station
-with an empty program, so the workflow is: `get_station_config`, edit the text, `import_station_config`,
-`compile_station`, then `copy_blocks` and `get_symbol_table` / `import_symbols` to bring the program
-across. The original station is left untouched.
+In place, in the existing station (the program is untouched): `get_station_hardware` to find a module's
+path, `get_module_parameters`, then `update_module`, `add_module` or `remove_module`, and finally
+`compile_station`. Values STEP 7 does not accept are rejected and the old value is kept.
+
+I/O addresses are the exception: STEP 7 accepts an address change through this interface but never saves
+it. To change addresses, use the text route, which always creates a new station with an empty program:
+`get_station_config`, edit the text, `import_station_config`, `compile_station`, then `copy_blocks` and
+`get_symbol_table` / `import_symbols` to bring the program across. The original station is left untouched.
 
 ## Notes
 
@@ -163,9 +171,12 @@ across. The original station is left untouched.
 ## Test status
 
 Tested against S7-PLCSIM V5.4: project browsing, source import and compile, block download/upload/compare,
-CPU start/stop, live read/write, diagnostics, station import and compile, block copy. Not yet tested:
-anything on a real CPU, `route="direct"` against a real CPU, `download_system_data`, `memory_reset`,
-`compress_memory`, SCL sources.
+CPU start/stop, live read/write, diagnostics, station import and compile, block copy, in-place hardware
+edits on a central rack. Not yet tested: anything on a real CPU, `route="direct"` against a real CPU,
+`download_system_data`, `memory_reset`, `compress_memory`, hardware edits on DP slaves.
+
+SCL sources need a working S7-SCL package. On the development PC (STEP 7 V5.6 with S7-SCL V5.7) STEP 7
+refused the import with "software package 'S7-SCL' ... not installed or exists in an earlier version".
 
 ## Credits
 

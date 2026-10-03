@@ -459,9 +459,12 @@ function Op-CompileStation($a) {
     try { $st = $proj.Stations.Item([string]$name) } catch { }
     if ($null -eq $st) { throw "Station '$name' not found in project '$($proj.Name)'." }
     $logStart = VerbLogLength
-    $rc = 0
-    $st.Compile([ref]$rc)
-    return [ordered]@{ station = $st.Name; code = [int]$rc; log = (VerbLogSince $logStart) }
+    $checkOnly = 0
+    if ([bool](Arg $a 'check_only' $false)) { $checkOnly = 1 }
+    try { $st.Compile($checkOnly) } catch {
+        return [ordered]@{ station = $st.Name; compiled = $false; consistent = $false; error = $_.Exception.Message; log = (VerbLogSince $logStart) }
+    }
+    return [ordered]@{ station = $st.Name; compiled = ($checkOnly -eq 0); consistent = $true; log = (VerbLogSince $logStart) }
 }
 
 function Op-DownloadSystemData($a) {
@@ -487,6 +490,155 @@ function Op-ImportStation($a) {
     } finally {
         if (Test-Path $tmp) { Remove-Item $tmp -Force }
     }
+}
+
+# ------------------------------------------------ hardware configuration (in place)
+#
+# Hardware objects are addressed by a dotted path:
+#   "0.4"       rack 0, slot 4            "0.2.1"     submodule/interface 1 of the module in slot 2
+#   "dp1.83"    DP master system 1, slave at address 83      "dp1.83.1"  slot 1 of that slave
+
+function Find-Station($a) {
+    $proj = Find-Project (Need $a 'project')
+    $name = Need $a 'station'
+    $st = $null
+    try { $st = $proj.Stations.Item([string]$name) } catch { }
+    if ($null -eq $st) { throw "Station '$name' not found in project '$($proj.Name)'." }
+    return , $st
+}
+
+function Find-ByIndex($coll, $index, $what) {
+    foreach ($o in $coll) { if ([string]$o.Index -eq [string]$index) { return , $o } }
+    throw "$what '$index' not found."
+}
+
+function Find-HwObject($st, $path) {
+    $parts = ([string]$path).Trim().Split('.')
+    if ($parts[0] -match '^dp(\d+)$') {
+        $ss = Find-ByIndex $st.SubSystems $Matches[1] 'DP master system'
+        if ($parts.Length -lt 2) { throw "Path '$path' needs a slave address, e.g. dp$($Matches[1]).5" }
+        $obj = Find-ByIndex $ss.Slaves $parts[1] 'Slave'
+        $rest = 2
+    } else {
+        $obj = Find-ByIndex $st.Racks $parts[0] 'Rack'
+        $rest = 1
+    }
+    for ($i = $rest; $i -lt $parts.Length; $i++) { $obj = Find-ByIndex $obj.Modules $parts[$i] 'Module/slot' }
+    return , $obj
+}
+
+function AddressList($coll) {
+    $out = New-Object System.Collections.ArrayList
+    try { foreach ($x in $coll) { if ([int]$x.Length -gt 0) { [void]$out.Add([ordered]@{ address = [int]$x.LogicalAddress; length = [int]$x.Length }) } } } catch { }
+    return , $out
+}
+
+function HwInfo($m, $path, $deep) {
+    $o = [ordered]@{ path = $path; name = $m.Name; orderNumber = $m.MLFB }
+    try { if ("$($m.Version)" -ne '') { $o['version'] = $m.Version } } catch { }
+    $in = AddressList $m.LocalInAddresses
+    if ($in.Count -gt 0) { $o['inputs'] = $in }
+    try { $out = AddressList $m.LocalOutAddresses; if ($out.Count -gt 0) { $o['outputs'] = $out } } catch { }
+    $net = [ordered]@{ IPAddress = 'ipAddress'; SubnetMask = 'subnetMask'; MPIAddress = 'mpiAddress'; PROFIBUSAddress = 'profibusAddress' }
+    foreach ($prop in $net.Keys) {
+        try { $v = $m.$prop; if ($null -ne $v -and "$v" -ne '' -and "$v" -ne '0') { $o[$net[$prop]] = $v } } catch { }
+    }
+    try { $ss = $m.SubSystem; if ($null -ne $ss) { $o['dpMasterSystem'] = "dp$($ss.Index)" } } catch { }
+    if ($deep) {
+        $subs = New-Object System.Collections.ArrayList
+        try { foreach ($sub in $m.Modules) { [void]$subs.Add((HwInfo $sub "$path.$($sub.Index)" $true)) } } catch { }
+        if ($subs.Count -gt 0) { $o['modules'] = $subs }
+    }
+    return $o
+}
+
+function Op-StationHardware($a) {
+    $st = Find-Station $a
+    $racks = New-Object System.Collections.ArrayList
+    foreach ($r in $st.Racks) {
+        $mods = New-Object System.Collections.ArrayList
+        foreach ($m in $r.Modules) { [void]$mods.Add((HwInfo $m "$($r.Index).$($m.Index)" $true)) }
+        [void]$racks.Add([ordered]@{ path = [string]$r.Index; name = $r.Name; orderNumber = $r.MLFB; modules = $mods })
+    }
+    $systems = New-Object System.Collections.ArrayList
+    foreach ($ss in $st.SubSystems) {
+        $slaves = New-Object System.Collections.ArrayList
+        foreach ($sl in $ss.Slaves) { [void]$slaves.Add((HwInfo $sl "dp$($ss.Index).$($sl.Index)" $true)) }
+        [void]$systems.Add([ordered]@{ path = "dp$($ss.Index)"; name = $ss.Name; subnet = $ss.SubnetName; slaves = $slaves })
+    }
+    return [ordered]@{ station = $st.Name; racks = $racks; dpMasterSystems = $systems }
+}
+
+function Op-ModuleParameters($a) {
+    $st = Find-Station $a
+    $m = Find-HwObject $st (Need $a 'module')
+    $out = New-Object System.Collections.ArrayList
+    $n = ''; $v = ''; $f = 0; $c = 0
+    $rc = $m.GetFirstParameter([ref]$n, [ref]$v, [ref]$f, [ref]$c)
+    while ($rc -ne 0) {
+        $p = [ordered]@{ name = $n; value = $v }
+        if ([int]$c -ge 0) { $p['channel'] = [int]$c }
+        [void]$out.Add($p)
+        $rc = $m.GetNextParameter([ref]$n, [ref]$v, [ref]$f, [ref]$c)
+    }
+    return [ordered]@{ module = (HwInfo $m ([string]$a.module) $false); parameters = $out }
+}
+
+function Op-UpdateModule($a) {
+    $st = Find-Station $a
+    $m = Find-HwObject $st (Need $a 'module')
+    $done = New-Object System.Collections.ArrayList
+    $name = Arg $a 'name'
+    if ($null -ne $name) { $m.Name = [string]$name; [void]$done.Add('name') }
+    $params = Arg $a 'parameters'
+    if ($null -ne $params) {
+        foreach ($prop in $params.PSObject.Properties) {
+            # "NAME" for a module parameter, "NAME[3]" for a parameter of channel 3
+            $pn = $prop.Name; $ch = -1
+            if ($pn -match '^(.*)\[(\d+)\]$') { $pn = $Matches[1]; $ch = [int]$Matches[2] }
+            $old = ''; $flags = 0
+            try { $m.GetParameter($pn, [ref]$old, [ref]$flags, $ch) } catch { $old = $null }
+            if ($null -eq $old -or "$old" -eq '') { throw "Parameter '$($prop.Name)' does not exist on this module (see get_module_parameters)." }
+            # STEP 7 silently stores 0 for a value it cannot parse, so read back and undo.
+            $now = ''
+            try { $m.PutParameter($pn, [string]$prop.Value, $flags, $ch); $m.GetParameter($pn, [ref]$now, [ref]$flags, $ch) } catch { $now = $null }
+            if ("$now" -ne [string]$prop.Value) {
+                try { $m.PutParameter($pn, [string]$old, $flags, $ch) } catch { }
+                throw "Value '$($prop.Value)' was not accepted for parameter '$($prop.Name)' (current value: $old)."
+            }
+            [void]$done.Add("$($prop.Name): $old -> $($prop.Value)")
+        }
+    }
+    # I/O addresses are not offered here: STEP 7 accepts LogicalAddress changes in memory but never saves them.
+    $v = Arg $a 'ip_address'; if ($null -ne $v) { $m.IPAddress = [string]$v; [void]$done.Add('ip_address') }
+    $v = Arg $a 'subnet_mask'; if ($null -ne $v) { $m.SubnetMask = [string]$v; [void]$done.Add('subnet_mask') }
+    $v = Arg $a 'mpi_address'
+    if ($null -ne $v) {
+        # Newer CPUs expose the property; older ones only have the attribute.
+        try { $m.MPIAddress = [int]$v } catch { $m.Attribute('MPI_ADDRESS') = [string]$v }
+        [void]$done.Add('mpi_address')
+    }
+    $v = Arg $a 'profibus_address'; if ($null -ne $v) { $m.PROFIBUSAddress = [int]$v; [void]$done.Add('profibus_address') }
+    (Get-S7).Save()
+    return [ordered]@{ changed = $done; module = (HwInfo $m ([string]$a.module) $false) }
+}
+
+function Op-AddModule($a) {
+    $st = Find-Station $a
+    $parent = Find-HwObject $st (Need $a 'parent')
+    $slot = [int](Need $a 'slot')
+    $m = $parent.Modules.Add([string](Arg $a 'name' ''), [string](Need $a 'order_number'), [string](Arg $a 'version' ''), $slot)
+    (Get-S7).Save()
+    return (HwInfo $m "$($a.parent).$($m.Index)" $true)
+}
+
+function Op-RemoveModule($a) {
+    $st = Find-Station $a
+    $m = Find-HwObject $st (Need $a 'module')
+    $info = HwInfo $m ([string]$a.module) $false
+    $m.Remove()
+    (Get-S7).Save()
+    return [ordered]@{ removed = $info }
 }
 
 function Op-CopyBlocks($a) {
@@ -516,6 +668,8 @@ function Op-CopyBlocks($a) {
 
 $OPS = @{
     copy_blocks = 'Op-CopyBlocks'
+    station_hardware = 'Op-StationHardware'; module_parameters = 'Op-ModuleParameters'
+    update_module = 'Op-UpdateModule'; add_module = 'Op-AddModule'; remove_module = 'Op-RemoveModule'
     download_system_data ='Op-DownloadSystemData'; import_station = 'Op-ImportStation'
     cpu_state = 'Op-CpuState'; cpu_control = 'Op-CpuControl'; list_online_blocks = 'Op-ListOnlineBlocks'
     download = 'Op-Download'; upload = 'Op-Upload'; compare = 'Op-Compare'; compile_station = 'Op-CompileStation'
