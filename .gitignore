@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+# Machine-specific paths; copy .mcp.example.json instead
+.mcp.json
+.claude/
