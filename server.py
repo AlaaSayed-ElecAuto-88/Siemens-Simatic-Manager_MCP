@@ -10,14 +10,17 @@ from __future__ import annotations
 
 import csv
 import io
+import ipaddress
 import os
+import re
 import threading
 import time
+from pathlib import Path
 from typing import Any, Literal
 
 from mcp.server.fastmcp import FastMCP
 
-from ladder import stl_to_ladder
+from ladder import stl_to_ladder, stl_to_ladder_html
 from plc_values import Operand, decode, encode, parse_address
 from s7client import S7Client, S7Error, S7OnlineTransport, TcpTransport
 from worker import DEFAULT_TIMEOUT, Bridge, BridgeError
@@ -307,6 +310,25 @@ def get_block_ladder(project: str, blocks: list[str], program: str | None = None
 
 
 @mcp.tool()
+def export_block_ladder(project: str, blocks: list[str], output_dir: str, program: str | None = None) -> list[dict]:
+    """Write each block as an HTML page with drawn ladder rungs (SVG), one file per block, into output_dir.
+
+    Same coverage as get_block_ladder: networks that cannot be drawn appear as STL on the page. Returns the
+    file paths; open them in a browser.
+    """
+    folder = Path(output_dir)
+    if not folder.is_dir():
+        raise ValueError(f"Directory '{output_dir}' does not exist.")
+    results = bridge.call("block_source", project=project, program=program, blocks=blocks, flags=0)
+    for r in results:
+        if "source" in r:
+            path = folder / f"{re.sub(r'[^A-Za-z0-9_-]', '_', r['block'])}.html"
+            path.write_text(stl_to_ladder_html(r.pop("source"), f"{r['block']} - {project}"), encoding="utf-8")
+            r["file"] = str(path)
+    return results
+
+
+@mcp.tool()
 def import_station_config(project: str, config: str) -> dict:
     """Create a station from HW Config export text. Modifies the offline project.
 
@@ -336,6 +358,37 @@ def get_module_parameters(project: str, station: str, module: str) -> dict:
     return bridge.call("module_parameters", project=project, station=station, module=module)
 
 
+def _walk_hardware(nodes: list[dict]):
+    for node in nodes:
+        yield node
+        yield from _walk_hardware(node.get("modules", []))
+
+
+def _check_address_overlap(project: str, station: str, module: str, input_address: int | None, output_address: int | None) -> None:
+    """Refuse a new start address that would overlap another module's inputs or outputs."""
+    hardware = bridge.call("station_hardware", project=project, station=station)
+    roots = hardware["racks"] + [slave for system in hardware["dpMasterSystems"] for slave in system["slaves"]]
+    modules = [m for m in _walk_hardware(roots) if "path" in m]
+    target = next((m for m in modules if m["path"] == module), None)
+    if target is None:
+        raise ValueError(f"Module '{module}' not found (see get_station_hardware).")
+    for kind, start in (("inputs", input_address), ("outputs", output_address)):
+        if start is None:
+            continue
+        if not target.get(kind):
+            raise ValueError(f"Module '{module}' has no {kind[:-1]} address.")
+        end = start + target[kind][0]["length"] - 1
+        for other in modules:
+            if other["path"] == module:
+                continue
+            for used in other.get(kind, []):
+                if start <= used["address"] + used["length"] - 1 and used["address"] <= end:
+                    raise ValueError(
+                        f"{kind[:-1].capitalize()} address {start}..{end} overlaps '{other['name']}' ({other['path']}) "
+                        f"at {used['address']}..{used['address'] + used['length'] - 1}."
+                    )
+
+
 @mcp.tool()
 def update_module(
     project: str,
@@ -343,8 +396,11 @@ def update_module(
     module: str,
     name: str | None = None,
     parameters: dict[str, str] | None = None,
+    input_address: int | None = None,
+    output_address: int | None = None,
     ip_address: str | None = None,
     subnet_mask: str | None = None,
+    router: str | None = None,
     mpi_address: int | None = None,
     profibus_address: int | None = None,
 ) -> dict:
@@ -352,11 +408,23 @@ def update_module(
 
     parameters maps parameter names from get_module_parameters to new values, e.g.
     {"SCAN_CYCLE_MONITORING_TIME": "200"}; use "NAME[3]" for a parameter of channel 3. A value STEP 7 does
-    not accept is rejected and the old value kept. I/O addresses cannot be changed this way (STEP 7 does not
-    save them); use get_station_config / import_station_config for that. Run compile_station afterwards.
+    not accept is rejected and the old value kept. input_address / output_address set the module's start
+    address. ip_address, subnet_mask and router apply to the Ethernet interface (e.g. the "PN-IO" submodule
+    of a CPU, or a CP); router="" switches the router off. STEP 7 does not check address overlaps here, so
+    run compile_station (check_only=True first) afterwards.
     """
+    # STEP 7 stores whatever it is given here, so validate what it does not.
+    for label, value in (("ip_address", ip_address), ("subnet_mask", subnet_mask), ("router", router)):
+        if value:
+            try:
+                ipaddress.IPv4Address(value)
+            except ValueError:
+                raise ValueError(f"{label} '{value}' is not a valid IPv4 address.") from None
+    if input_address is not None or output_address is not None:
+        _check_address_overlap(project, station, module, input_address, output_address)
     return bridge.call("update_module", project=project, station=station, module=module, name=name, parameters=parameters,
-                       ip_address=ip_address, subnet_mask=subnet_mask, mpi_address=mpi_address, profibus_address=profibus_address)
+                       input_address=input_address, output_address=output_address, ip_address=ip_address,
+                       subnet_mask=subnet_mask, router=router, mpi_address=mpi_address, profibus_address=profibus_address)
 
 
 @mcp.tool()
@@ -556,8 +624,9 @@ def write_plc_values(
 
     values maps an operand address or symbol name (as in read_plc_values) to the new value: true/false for
     bits, numbers for BYTE/WORD/INT/DINT/REAL (hex as "W#16#00FF"), seconds for S5TIME, milliseconds for TIME.
-    Inputs and outputs are overwritten again by the next process-image update. Timers and counters cannot
-    be written. Each result includes the value read back afterwards.
+    Timers ("T 5") take the remaining time in seconds and counters ("C 3") a count from 0 to 999.
+    Inputs and outputs are overwritten again by the next process-image update. Each result includes the
+    value read back afterwards.
     """
     _require_plc_writes()
     results: list[dict] = []
@@ -631,6 +700,41 @@ def get_cpu_diagnostics(address: str, rack: int = 0, slot: int = 2, route: Route
     a text for common events, and the raw additional information.
     """
     return _with_client(address, rack, slot, route, lambda c: _diagnostics(c, entries))
+
+
+def _parse_diagnostic_export(text: str) -> list[dict]:
+    """Split STEP 7's diagnostic buffer export into events (number, ID, title, details, direction, time)."""
+    events = []
+    for chunk in text.split("</EVENT_ID/>"):
+        lines = [line.strip() for line in chunk.splitlines() if line.strip()]
+        if len(lines) < 2 or "Event ID" not in lines[0]:
+            continue
+        event: dict[str, Any] = {"number": int(lines[0].split()[1]), "event_id": "16#" + lines[0].split("16#")[1].strip()}
+        body = lines[1:]
+        # The last line is "time<TAB>date"; the one before says whether the event is incoming or outgoing.
+        if "\t" in body[-1]:
+            clock, date = body.pop().split("\t")[:2]
+            event["time"] = f"{date.strip()} {clock.strip()}"
+        if body and body[-1].lower().endswith("event"):
+            event["direction"] = body.pop()
+        event["text"] = body[0] if body else ""
+        if body[1:]:
+            event["details"] = body[1:]
+        events.append(event)
+    return events
+
+
+@mcp.tool()
+def get_diagnostic_buffer(project: str, station: str, cpu: str = "0.2", entries: int = 10) -> dict:
+    """Read the CPU's diagnostic buffer with STEP 7's full event texts and details, newest first.
+
+    cpu is the CPU module's hardware path from get_station_hardware (rack 0, slot 2 by default). The CPU must
+    be reachable online through STEP 7's PG/PC interface (S7-PLCSIM counts). Use get_cpu_diagnostics when
+    only an address is known and no project is at hand.
+    """
+    result = bridge.call("diagnostic_buffer", project=project, station=station, module=cpu)
+    events = _parse_diagnostic_export(result["text"])
+    return {"cpu": result["cpu"], "total_events": len(events), "events": events[:entries]}
 
 
 if __name__ == "__main__":

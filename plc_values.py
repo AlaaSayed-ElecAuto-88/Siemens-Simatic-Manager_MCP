@@ -126,12 +126,17 @@ def encode(operand: Operand, value: Any) -> bytes:
         return str(value).encode("latin-1")[:1].ljust(1, b" ")
     if t == "TIME":
         return _to_int(value).to_bytes(4, "big", signed=True)
-    if t == "S5TIME":
+    if t == "COUNTER":
+        count = _to_int(value)
+        if not 0 <= count <= 999:
+            raise ValueError("A counter value must be between 0 and 999.")
+        return int(str(count), 16).to_bytes(2, "big")
+    if t in ("S5TIME", "TIMER"):
         ticks = round(float(value) * 100)          # value in seconds, 10 ms ticks
         base = 0
         while ticks > 999 and base < 3:
             ticks, base = round(ticks / 10), base + 1
         if not 0 <= ticks <= 999:
-            raise ValueError("S5TIME must be between 0 and 9990 seconds.")
+            raise ValueError("A time value must be between 0 and 9990 seconds.")
         return (base << 12 | int(str(ticks), 16)).to_bytes(2, "big")
     raise ValueError(f"Writing data type {t} is not supported.")

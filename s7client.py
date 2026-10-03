@@ -166,8 +166,8 @@ class S7Client:
 
     def write(self, item: Item, value: bytes) -> None:
         if item.is_timer_or_counter:
-            raise S7Error("Writing timers and counters is not supported.")
-        if item.bit is not None:
+            payload = bytes([0, 9, 0, 2]) + value          # one 2-byte element, sent as an octet string
+        elif item.bit is not None:
             payload = bytes([0, 3, 0, 1, 1 if value[0] else 0])
         else:
             payload = bytes([0, 4]) + struct.pack(">H", len(value) * 8) + value

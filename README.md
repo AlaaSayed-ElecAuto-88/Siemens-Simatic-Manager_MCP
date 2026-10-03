@@ -23,6 +23,7 @@ MCP client -- server.py ---+
 | `server.py` | MCP tools |
 | `worker.py` | Runs a PowerShell worker and exchanges JSON lines with it |
 | `bridge/s7bridge.ps1` | STEP 7 command interface (projects, blocks, compile, download, CPU control) |
+| `bridge/S7HwInterop.cs` | Early-bound access to STEP 7's newer hardware interface |
 | `bridge/s7online_link.ps1` | Carries S7 messages over the `S7ONLINE` access point |
 | `s7client.py` | S7 protocol client: read/write memory, system status lists |
 | `plc_values.py` | Operand addresses and data types |
@@ -74,6 +75,7 @@ project has only one program.
 | `list_blocks` | Blocks of a program with header info |
 | `get_block_source` | Decompile blocks to STL text (symbolic or absolute) |
 | `get_block_ladder` | Blocks as text-drawn ladder rungs |
+| `export_block_ladder` | Blocks as HTML pages with drawn ladder rungs (writes files only) |
 | `list_sources` / `get_source` | Read the Sources folder |
 | `get_symbol_table` | Symbols, optionally filtered |
 | `get_station_config` | Hardware configuration as HW Config export text |
@@ -89,7 +91,7 @@ project has only one program.
 | `import_symbols` | Add or update symbols |
 | `copy_blocks` | Copy blocks between programs or projects |
 | `create_project` / `add_program` | New empty project / S7 program |
-| `update_module` | Change a module in place: name, parameters, IP / MPI / PROFIBUS address |
+| `update_module` | Change a module in place: name, parameters, I/O addresses, IP / router / MPI / PROFIBUS address |
 | `add_module` / `remove_module` | Insert or remove a module in an existing station |
 | `import_station_config` | Create a station from (edited) HW Config text |
 | `compile_station` | Compile a station's hardware configuration, or only check its consistency |
@@ -103,7 +105,8 @@ project has only one program.
 | `list_online_blocks` | Blocks loaded in the CPU |
 | `compare_online_offline` | Per block: identical / different / not in CPU |
 | `read_plc_values` | Live inputs, outputs, memory bits, timers, counters, DB values; by address or symbol name |
-| `get_cpu_diagnostics` | State, order number, firmware, diagnostic buffer |
+| `get_cpu_diagnostics` | State, order number, firmware, diagnostic buffer (by address, no project needed) |
+| `get_diagnostic_buffer` | Diagnostic buffer with STEP 7's full event texts and details (needs the project) |
 
 ### Change the PLC (disabled by default)
 
@@ -112,7 +115,7 @@ project has only one program.
 | `download_blocks` | Download offline blocks to the CPU |
 | `download_system_data` | Download the compiled hardware configuration (CPU in STOP) |
 | `start_cpu` / `stop_cpu` | Warm/hot restart, or STOP |
-| `write_plc_values` | Write memory bits, outputs, DB values |
+| `write_plc_values` | Write memory bits, outputs, DB values, timers and counters |
 | `memory_reset` | Erase the CPU's program (CPU in STOP) |
 | `compress_memory` | Compress the CPU's load memory |
 
@@ -148,10 +151,15 @@ Then connect the client to `127.0.0.1`, port 1102. The server itself does not ne
 
 In place, in the existing station (the program is untouched): `get_station_hardware` to find a module's
 path, `get_module_parameters`, then `update_module`, `add_module` or `remove_module`, and finally
-`compile_station`. Values STEP 7 does not accept are rejected and the old value is kept.
+`compile_station`. Parameter values STEP 7 does not accept are rejected and the old value is kept. STEP 7
+itself does not check IP addresses or I/O address overlaps on this path, so the server does: an invalid
+IPv4 address or a start address that overlaps another module is refused.
 
-I/O addresses are the exception: STEP 7 accepts an address change through this interface but never saves
-it. To change addresses, use the text route, which always creates a new station with an empty program:
+Network properties, the I/O address commit and the diagnostic buffer export are only available on a newer
+STEP 7 interface (`IS7Module6`) that scripting cannot reach; `bridge/S7HwInterop.cs` binds it directly and
+is compiled by the bridge at start-up.
+
+The text route remains as an alternative; it always creates a new station with an empty program:
 `get_station_config`, edit the text, `import_station_config`, `compile_station`, then `copy_blocks` and
 `get_symbol_table` / `import_symbols` to bring the program across. The original station is left untouched.
 
@@ -162,18 +170,21 @@ it. To change addresses, use the text route, which always creates a new station 
 - `start_cpu` and `stop_cpu` fail when the CPU's mode switch is in STOP (in PLCSIM: tick RUN-P).
 - While PLCSIM is running it answers for every MPI address, so a wrong `address` still gets values.
 - Blocks uploaded from a CPU only decompile with `symbolic=True`.
-- `get_block_ladder` draws bit logic, edges, coils, timers and counters; other networks stay as STL.
-- Diagnostic buffer texts are included for common events only; the event ID is always returned.
+- The ladder tools draw bit logic, edges, compares, coils, timers, counters, and boxes for moves,
+  arithmetic and block calls (including the EN pattern). Networks with other jumps or instructions stay as
+  STL. On a 107-block production project, 84% of 1891 networks were drawn.
+- `get_cpu_diagnostics` has texts for common events only; `get_diagnostic_buffer` has STEP 7's full texts.
 - A call that gets no answer within `S7_MCP_TIMEOUT` seconds (default 180) restarts the worker.
 - Worker errors outside a request are written to `%TEMP%\s7mcp_*_stderr.log`.
-- Not possible: forcing values, opening know-how-protected blocks, writing timers and counters.
+- Not possible: forcing values, opening know-how-protected blocks.
 
 ## Test status
 
 Tested against S7-PLCSIM V5.4: project browsing, source import and compile, block download/upload/compare,
-CPU start/stop, live read/write, diagnostics, station import and compile, block copy, in-place hardware
-edits on a central rack. Not yet tested: anything on a real CPU, `route="direct"` against a real CPU,
-`download_system_data`, `memory_reset`, `compress_memory`, hardware edits on DP slaves.
+CPU start/stop, live read/write (including timers and counters), both diagnostic buffer tools, station
+import and compile, block copy, in-place hardware edits (central rack, Ethernet interfaces, DP slaves),
+hardware configuration download, memory reset and compress. Not yet tested: anything on a real CPU,
+including `route="direct"`.
 
 SCL sources need a working S7-SCL package. On the development PC (STEP 7 V5.6 with S7-SCL V5.7) STEP 7
 refused the import with "software package 'S7-SCL' ... not installed or exists in an earlier version".

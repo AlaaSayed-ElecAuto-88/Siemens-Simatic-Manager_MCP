@@ -16,6 +16,8 @@ $stdin = New-Object System.IO.StreamReader([Console]::OpenStandardInput(), $utf8
 $stdout = New-Object System.IO.StreamWriter([Console]::OpenStandardOutput(), $utf8)
 $stdout.AutoFlush = $true
 
+Add-Type -TypeDefinition (Get-Content (Join-Path $PSScriptRoot 'S7HwInterop.cs') -Raw)
+
 $WORK = Join-Path $env:TEMP 's7mcp'
 [void](New-Item -ItemType Directory -Force $WORK)
 $VERBLOG = Join-Path $WORK ("verb_{0}.log" -f $PID)
@@ -533,16 +535,31 @@ function AddressList($coll) {
     return , $out
 }
 
+function DottedAddress($text) {
+    # STEP 7 returns an untouched IP address as 8 hex digits ("C0A80001") and an edited one dotted.
+    if ("$text" -match '^[0-9A-Fa-f]{8}$') {
+        return ((0..3 | ForEach-Object { [Convert]::ToInt32($text.Substring($_ * 2, 2), 16) }) -join '.')
+    }
+    return "$text"
+}
+
+function Set-FirstAddress($coll, $value, $label) {
+    foreach ($x in $coll) { if ([int]$x.Length -gt 0) { $x.LogicalAddress = [int]$value; return } }
+    throw "The module has no $label address."
+}
+
 function HwInfo($m, $path, $deep) {
     $o = [ordered]@{ path = $path; name = $m.Name; orderNumber = $m.MLFB }
     try { if ("$($m.Version)" -ne '') { $o['version'] = $m.Version } } catch { }
     $in = AddressList $m.LocalInAddresses
     if ($in.Count -gt 0) { $o['inputs'] = $in }
     try { $out = AddressList $m.LocalOutAddresses; if ($out.Count -gt 0) { $o['outputs'] = $out } } catch { }
-    $net = [ordered]@{ IPAddress = 'ipAddress'; SubnetMask = 'subnetMask'; MPIAddress = 'mpiAddress'; PROFIBUSAddress = 'profibusAddress' }
-    foreach ($prop in $net.Keys) {
-        try { $v = $m.$prop; if ($null -ne $v -and "$v" -ne '' -and "$v" -ne '0') { $o[$net[$prop]] = $v } } catch { }
-    }
+    # Network properties live on the early-bound interface (S7HwInterop.cs); DP slaves do not have it.
+    try { $v = DottedAddress ([S7Hw.Module]::GetIP($m)); if ($v -ne '') { $o['ipAddress'] = $v } } catch { }
+    try { $v = DottedAddress ([S7Hw.Module]::GetSubnetMask($m)); if ($v -ne '') { $o['subnetMask'] = $v } } catch { }
+    try { $v = DottedAddress ([S7Hw.Module]::GetRouter($m)); if ($v -ne '') { $o['router'] = $v } } catch { }
+    try { $v = [S7Hw.Module]::GetMPIAddress($m); if ($v -gt 0) { $o['mpiAddress'] = $v } } catch { }
+    try { $v = $m.PROFIBUSAddress; if ($null -ne $v -and [int]$v -gt 0) { $o['profibusAddress'] = [int]$v } } catch { }
     try { $ss = $m.SubSystem; if ($null -ne $ss) { $o['dpMasterSystem'] = "dp$($ss.Index)" } } catch { }
     if ($deep) {
         $subs = New-Object System.Collections.ArrayList
@@ -609,13 +626,17 @@ function Op-UpdateModule($a) {
             [void]$done.Add("$($prop.Name): $old -> $($prop.Value)")
         }
     }
-    # I/O addresses are not offered here: STEP 7 accepts LogicalAddress changes in memory but never saves them.
-    $v = Arg $a 'ip_address'; if ($null -ne $v) { $m.IPAddress = [string]$v; [void]$done.Add('ip_address') }
-    $v = Arg $a 'subnet_mask'; if ($null -ne $v) { $m.SubnetMask = [string]$v; [void]$done.Add('subnet_mask') }
+    $addressChanged = $false
+    $v = Arg $a 'input_address'; if ($null -ne $v) { Set-FirstAddress $m.LocalInAddresses $v 'input'; [void]$done.Add('input_address'); $addressChanged = $true }
+    $v = Arg $a 'output_address'; if ($null -ne $v) { Set-FirstAddress $m.LocalOutAddresses $v 'output'; [void]$done.Add('output_address'); $addressChanged = $true }
+    if ($addressChanged) { [S7Hw.Module]::CommitAddresses($m) }
+    $v = Arg $a 'ip_address'; if ($null -ne $v) { [S7Hw.Module]::SetIP($m, [string]$v); [void]$done.Add('ip_address') }
+    $v = Arg $a 'subnet_mask'; if ($null -ne $v) { [S7Hw.Module]::SetSubnetMask($m, [string]$v); [void]$done.Add('subnet_mask') }
+    $v = Arg $a 'router'; if ($null -ne $v) { [S7Hw.Module]::SetRouter($m, [string]$v); [void]$done.Add('router') }
     $v = Arg $a 'mpi_address'
     if ($null -ne $v) {
-        # Newer CPUs expose the property; older ones only have the attribute.
-        try { $m.MPIAddress = [int]$v } catch { $m.Attribute('MPI_ADDRESS') = [string]$v }
+        # CPUs with an interface submodule take the property; older ones only have the attribute.
+        try { [S7Hw.Module]::SetMPIAddress($m, [int]$v) } catch { $m.Attribute('MPI_ADDRESS') = [string]$v }
         [void]$done.Add('mpi_address')
     }
     $v = Arg $a 'profibus_address'; if ($null -ne $v) { $m.PROFIBUSAddress = [int]$v; [void]$done.Add('profibus_address') }
@@ -630,6 +651,19 @@ function Op-AddModule($a) {
     $m = $parent.Modules.Add([string](Arg $a 'name' ''), [string](Need $a 'order_number'), [string](Arg $a 'version' ''), $slot)
     (Get-S7).Save()
     return (HwInfo $m "$($a.parent).$($m.Index)" $true)
+}
+
+function Op-DiagnosticBuffer($a) {
+    $st = Find-Station $a
+    $cpu = Find-HwObject $st (Need $a 'module')
+    $tmp = TempFile 'txt'
+    try {
+        [void][S7Hw.Module]::ExportDiagnosticBuffer($cpu, $tmp)
+        if (-not (Test-Path $tmp)) { throw "STEP 7 returned no diagnostic buffer; the CPU '$($cpu.Name)' may not be reachable online." }
+        return [ordered]@{ cpu = $cpu.Name; text = [IO.File]::ReadAllText($tmp, $ansi) }
+    } finally {
+        if (Test-Path $tmp) { Remove-Item $tmp -Force }
+    }
 }
 
 function Op-RemoveModule($a) {
@@ -669,7 +703,7 @@ function Op-CopyBlocks($a) {
 $OPS = @{
     copy_blocks = 'Op-CopyBlocks'
     station_hardware = 'Op-StationHardware'; module_parameters = 'Op-ModuleParameters'
-    update_module = 'Op-UpdateModule'; add_module = 'Op-AddModule'; remove_module = 'Op-RemoveModule'
+    diagnostic_buffer = 'Op-DiagnosticBuffer'; update_module = 'Op-UpdateModule'; add_module = 'Op-AddModule'; remove_module = 'Op-RemoveModule'
     download_system_data ='Op-DownloadSystemData'; import_station = 'Op-ImportStation'
     cpu_state = 'Op-CpuState'; cpu_control = 'Op-CpuControl'; list_online_blocks = 'Op-ListOnlineBlocks'
     download = 'Op-Download'; upload = 'Op-Upload'; compare = 'Op-Compare'; compile_station = 'Op-CompileStation'
